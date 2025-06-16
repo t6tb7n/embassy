@@ -41,6 +41,7 @@ pub mod rom_data;
 #[cfg(feature = "rp2040")]
 pub mod rtc;
 pub mod spi;
+pub mod spi_slave;
 #[cfg(feature = "time-driver")]
 pub mod time_driver;
 #[cfg(feature = "_rp235x")]
@@ -615,7 +616,7 @@ pub fn init(config: config::Config) -> Peripherals {
         clocks::init(config.clocks);
         #[cfg(feature = "time-driver")]
         time_driver::init();
-        dma::init();
+        // dma::init();
         gpio::init();
     }
 
@@ -623,6 +624,7 @@ pub fn init(config: config::Config) -> Peripherals {
 }
 
 #[cfg(feature = "rt")]
+#[link_section = ".Reset"]
 #[cortex_m_rt::pre_init]
 unsafe fn pre_init() {
     // SIO does not get reset when core0 is reset with either `scb::sys_reset()` or with SWD.
