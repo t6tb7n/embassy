@@ -117,6 +117,10 @@ pub unsafe fn init() {
         alarm.timestamp.set(u64::MAX);
     });
 
+    TIMER.source().write(|w| {
+        w.set_clk_sys(rp_pac::timer::vals::ClkSys::CLK_SYS);
+    });
+
     // enable irq
     TIMER.inte().write(|w| {
         w.set_alarm(0, true);
