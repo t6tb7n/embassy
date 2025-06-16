@@ -627,14 +627,14 @@ impl<'d, T: Instance> driver::EndpointIn for Endpoint<'d, T, In> {
             w.set_pid(0, pid);
             w.set_length(0, buf.len() as _);
             w.set_full(0, true);
-        });
-        cortex_m::asm::delay(12);
-        T::dpram().ep_in_buffer_control(index).write(|w| {
-            w.set_pid(0, pid);
-            w.set_length(0, buf.len() as _);
-            w.set_full(0, true);
             w.set_available(0, true);
         });
+        // cortex_m::asm::delay(12);
+        // T::dpram().ep_in_buffer_control(index).write(|w| {
+        //     w.set_pid(0, pid);
+        //     w.set_length(0, buf.len() as _);
+        //     w.set_full(0, true);
+        // });
 
         trace!("WRITE OK");
 
