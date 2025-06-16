@@ -12,7 +12,7 @@ use fixed::types::extra::U8;
 use fixed::FixedU32;
 use pio::{Program, SideSet, Wrap};
 
-use crate::dma::{Channel, Transfer, Word};
+use crate::dma::{Abandonable, Channel, ContinuousTransfer, Transfer, TransferInstrumented, Word};
 use crate::gpio::{self, AnyPin, Drive, Level, Pull, SealedPin, SlewRate};
 use crate::interrupt::typelevel::{Binding, Handler, Interrupt};
 use crate::relocate::RelocatedProgram;
@@ -294,6 +294,12 @@ impl<'l, PIO: Instance> Pin<'l, PIO> {
     }
 }
 
+#[derive(Debug)]
+pub enum ContinousError {
+    BufferFull,
+    Stalled,
+}
+
 /// Type representing a state machine RX FIFO.
 pub struct StateMachineRx<'d, PIO: Instance, const SM: usize> {
     pio: PhantomData<&'d mut PIO>,
@@ -317,6 +323,15 @@ impl<'d, PIO: Instance, const SM: usize> StateMachineRx<'d, PIO, SM> {
 
     /// Check if state machine has stalled on full RX FIFO.
     pub fn stalled(&self) -> bool {
+        let fdebug = PIO::PIO.fdebug();
+        let ret = fdebug.read().rxstall() & (1 << SM) != 0;
+        if ret {
+            fdebug.write(|w| w.set_rxstall(1 << SM));
+        }
+        ret
+    }
+
+    fn _stalled() -> bool {
         let fdebug = PIO::PIO.fdebug();
         let ret = fdebug.read().rxstall() & (1 << SM) != 0;
         if ret {
@@ -385,6 +400,275 @@ impl<'d, PIO: Instance, const SM: usize> StateMachineRx<'d, PIO, SM> {
         });
         compiler_fence(Ordering::SeqCst);
         Transfer::new(ch)
+    }
+
+    /// Prepare DMA transfer from RX FIFO.
+    pub fn dma_pull_instrumented<'a, C: Channel, W: Word>(
+        &'a mut self,
+        ch: PeripheralRef<'a, C>,
+        data: &'a mut [W],
+        bswap: bool,
+    ) -> TransferInstrumented<'a, C> {
+        let pio_no = PIO::PIO_NO;
+        let p = ch.regs();
+        p.write_addr().write_value(data.as_ptr() as u32);
+        p.read_addr().write_value(PIO::PIO.rxf(SM).as_ptr() as u32);
+        #[cfg(feature = "rp2040")]
+        p.trans_count().write(|w| *w = data.len() as u32);
+        #[cfg(feature = "_rp235x")]
+        p.trans_count().write(|w| w.set_count(data.len() as u32));
+        compiler_fence(Ordering::SeqCst);
+        p.ctrl_trig().write(|w| {
+            // Set RX DREQ for this statemachine
+            w.set_treq_sel(crate::pac::dma::vals::TreqSel::from(pio_no * 8 + SM as u8 + 4));
+            w.set_data_size(W::size());
+            w.set_chain_to(ch.number());
+            w.set_incr_read(false);
+            w.set_incr_write(true);
+            w.set_bswap(bswap);
+            w.set_en(true);
+        });
+        compiler_fence(Ordering::SeqCst);
+        TransferInstrumented::new(ch)
+    }
+
+    /// Prepare DMA transfer from RX FIFO.
+    pub fn dma_pull_continuous<'a, C: Channel, W: Word, const M: usize, const N: usize>(
+        &'a mut self,
+        ch: PeripheralRef<'a, C>,
+        data: &mut [[W; M]; N],
+        bswap: bool,
+    ) -> Transfer<'a, C> {
+        assert!(align_of_val(data) >= size_of_val(data));
+        assert!(size_of_val(data) < 2 ^ 15);
+        let pio_no = PIO::PIO_NO;
+        let p = ch.regs();
+        p.write_addr().write_value(data.as_ptr() as u32);
+        p.read_addr().write_value(PIO::PIO.rxf(SM).as_ptr() as u32);
+        #[cfg(feature = "rp2040")]
+        p.trans_count().write(|w| *w = data.len() as u32);
+        #[cfg(feature = "_rp235x")]
+        p.trans_count().write(|w| {
+            w.set_count(data.len() as u32);
+            w.set_mode(rp_pac::dma::vals::TransCountMode::ENDLESS);
+        });
+        compiler_fence(Ordering::SeqCst);
+        p.ctrl_trig().write(|w| {
+            // Set RX DREQ for this statemachine
+            w.set_treq_sel(crate::pac::dma::vals::TreqSel::from(pio_no * 8 + SM as u8 + 4));
+            w.set_data_size(W::size());
+            w.set_chain_to(ch.number());
+            w.set_incr_read(false);
+            w.set_incr_write(true);
+            w.set_bswap(bswap);
+            w.set_en(true);
+            w.set_ring_size(size_of_val(data).trailing_zeros().try_into().unwrap());
+            w.set_ring_sel(true); // Wrap write addresses
+        });
+        compiler_fence(Ordering::SeqCst);
+        Transfer::new(ch)
+    }
+
+    /// Enable state machine.
+    fn set_enable_(enable: bool) {
+        let mask = 1u8 << SM;
+        if enable {
+            PIO::PIO.ctrl().write_set(|w| w.set_sm_enable(mask));
+        } else {
+            PIO::PIO.ctrl().write_clear(|w| w.set_sm_enable(mask));
+        }
+    }
+
+    /// Prepare Chained DMA transfers for RX FIFO.
+    pub fn dma_pull_chained<'a, 'b, C: Channel, RF, W: Word + 'static, const N: usize, F, S, const M: usize>(
+        &'a mut self,
+        channels: [PeripheralRef<'b, C>; M],
+        get_next_buffer: F,
+        mut step: S,
+    ) -> impl 'a + 'b + Future<Output = ([PeripheralRef<'b, C>; M], usize, usize, Result<(), ContinousError>)>
+    where
+        RF: core::ops::DerefMut<Target = [W; N]> + Abandonable,
+        F: Fn() -> Option<RF> + 'a + 'b,
+        S: FnMut(bool, usize) -> bool + 'a + 'b,
+        'b: 'a,
+    {
+        let pio_no = PIO::PIO_NO;
+
+        for channel in channels.windows(2) {
+            let p = channel[0].regs();
+            p.read_addr().write_value(PIO::PIO.rxf(SM).as_ptr() as u32);
+            #[cfg(feature = "rp2040")]
+            p.trans_count().write(|w| *w = data1.len() as u32);
+            #[cfg(feature = "_rp235x")]
+            p.trans_count().write(|w| w.set_count(N as u32));
+            // compiler_fence(Ordering::SeqCst);
+            p.al1_ctrl().write(|w| {
+                // Set RX DREQ for this statemachine
+                w.set_treq_sel(crate::pac::dma::vals::TreqSel::from(pio_no * 8 + SM as u8 + 4));
+                w.set_data_size(W::size());
+                w.set_chain_to(channel[1].number());
+                w.set_incr_read(false);
+                w.set_incr_write(true);
+                w.set_bswap(false);
+                w.set_en(true);
+            });
+        }
+
+        let p = channels[channels.len() - 1].regs();
+        p.read_addr().write_value(PIO::PIO.rxf(SM).as_ptr() as u32);
+        #[cfg(feature = "rp2040")]
+        p.trans_count().write(|w| *w = data2.len() as u32);
+        #[cfg(feature = "_rp235x")]
+        p.trans_count().write(|w| w.set_count(N as u32));
+        // compiler_fence(Ordering::SeqCst);
+        p.al1_ctrl().write(|w| {
+            // Set RX DREQ for this statemachine
+            w.set_treq_sel(crate::pac::dma::vals::TreqSel::from(pio_no * 8 + SM as u8 + 4));
+            w.set_data_size(W::size());
+            w.set_chain_to(channels[channels.len() - 1].number());
+            w.set_incr_read(false);
+            w.set_incr_write(true);
+            w.set_bswap(false);
+            w.set_en(true);
+        });
+
+        compiler_fence(Ordering::SeqCst);
+
+        async move {
+            // Configure buffers
+
+            let first_channel_number = channels[0].number();
+
+            let mut transfers = channels.map(|c| {
+                let buffer = get_next_buffer().unwrap();
+                c.regs().write_addr().write_value(buffer.as_ptr() as u32);
+                let transfer = ContinuousTransfer::new(c);
+                (transfer, Some(buffer))
+            });
+
+            // Trigger first DMA chanel
+            pac::DMA
+                .multi_chan_trigger()
+                .write(|w| w.set_multi_chan_trigger(0x1 << first_channel_number));
+            // channel.regs().al2_write_addr_trig().write_value(data1.as_ptr() as u32);
+
+            Self::set_enable_(true);
+
+            let mut current = 0;
+            let mut count = 0;
+            let mut stalled = 0;
+
+            loop {
+                (&transfers[current].0).await;
+                transfers[current].1.take();
+                count += 1;
+                if Self::_stalled() {
+                    stalled += 1;
+                }
+                if step(Self::_stalled(), count) {
+                    break;
+                }
+                let previous = if current == 0 { M - 1 } else { current - 1 };
+                if let Some(data) = get_next_buffer() {
+                    transfers[current]
+                        .0
+                        .channel
+                        .as_ref()
+                        .unwrap()
+                        .regs()
+                        .write_addr()
+                        .write_value(data.as_ptr() as u32);
+                    transfers[current].1 = Some(data);
+                    let current_channel_number = transfers[current].0.channel.as_ref().unwrap().number();
+                    transfers[current]
+                        .0
+                        .channel
+                        .as_ref()
+                        .unwrap()
+                        .regs()
+                        .al1_ctrl()
+                        .modify(|w| w.set_chain_to(current_channel_number));
+                    transfers[previous]
+                        .0
+                        .channel
+                        .as_ref()
+                        .unwrap()
+                        .regs()
+                        .al1_ctrl()
+                        .modify(|w| w.set_chain_to(current_channel_number));
+                    current = (current + 1) % M;
+                } else {
+                    transfers.rotate_left(current);
+                    return (
+                        transfers.map(|mut x| {
+                            if let Some(mut buffer) = x.1 {
+                                buffer.abandon();
+                            }
+                            x.0.drop_take()
+                        }),
+                        count,
+                        stalled,
+                        Err(ContinousError::BufferFull),
+                    );
+                }
+            }
+            // let transfer1 = ContinuousTransfer::new(ch1.reborrow());
+            // let transfer2 = ContinuousTransfer::new(ch2.reborrow());
+
+            // assert!(p1.ctrl_trig().read().busy());
+            // assert!(!p2.ctrl_trig().read().busy());
+            // loop {
+            //     (&transfer1).await;
+            //     if step(Self::_stalled(), count, unsafe { core::mem::transmute(p1.write_addr().read()) }, unsafe { core::mem::transmute(p2.write_addr().read()) }) {
+            //         drop(data1);
+            //         drop(data2);
+            //         break;
+            //     }
+            //     if let Some(b) = get_next_buffer() {
+            //         data1 = b;
+            //         // p1.ctrl_trig().modify(|m| m.set_en(false));
+            //         p1.write_addr().write_value(data1.as_ptr() as u32);
+            //         // p1.ctrl_trig().modify(|m| m.set_en(true));
+            //         assert!(!p1.ctrl_trig().read().busy());
+            //     } else {
+            //         return Err(ContinousError::BufferFull)
+            //     }
+            //     index = 1;
+            //     count += 1;
+            //     } else {
+            //         count += 1;
+            //         (&transfer2).await;
+            //         if step(Self::_stalled(), count, unsafe { core::mem::transmute(p1.write_addr().read()) }, unsafe { core::mem::transmute(p2.write_addr().read()) }) {
+            //             drop(data2);
+            //             drop(data1);
+            //             break;
+            //         }
+            //         if let Some(b) = get_next_buffer() {
+            //             data2 = b;
+            //             // p2.ctrl_trig().modify(|m| m.set_en(false));
+            //             p2.write_addr().write_value(data2.as_ptr() as u32);
+            //             // p2.ctrl_trig().modify(|m| m.set_en(true));
+            //             assert!(!p2.ctrl_trig().read().busy());
+            //         } else {
+            //             return Err(ContinousError::BufferFull)
+            //         }
+            //         index = 0;
+            //     }
+            // }
+
+            transfers.rotate_left(current);
+            (
+                transfers.map(|mut x| {
+                    if let Some(mut buffer) = x.1 {
+                        buffer.abandon();
+                    }
+                    x.0.drop_take()
+                }),
+                count,
+                stalled,
+                Ok(()),
+            )
+        }
     }
 }
 
@@ -952,6 +1236,40 @@ impl<'d, PIO: Instance + 'd, const SM: usize> StateMachine<'d, PIO, SM> {
         });
     }
 
+    /// Sets pin directions. This pauses the current state machine to run `SET` commands
+    /// and temporarily unsets the `OUT_STICKY` bit.
+    pub fn set_pin_dirs_iter<'a>(
+        &'a mut self,
+        dir: Direction,
+        pins: impl core::iter::Iterator<Item = &'a Pin<'d, PIO>>,
+    ) {
+        self.with_paused(|sm| {
+            for pin in pins {
+                Self::this_sm().pinctrl().write(|w| {
+                    w.set_set_base(pin.pin());
+                    w.set_set_count(1);
+                });
+                // SET PINDIRS, (dir)
+                unsafe { sm.exec_instr(0b111_00000_100_00000 | dir as u16) };
+            }
+        });
+    }
+
+    /// Sets pin output values. This pauses the current state machine to run
+    /// `SET` commands and temporarily unsets the `OUT_STICKY` bit.
+    pub fn set_pins_iter<'a>(&'a mut self, level: Level, pins: impl core::iter::Iterator<Item = &'a Pin<'d, PIO>>) {
+        self.with_paused(|sm| {
+            for pin in pins {
+                Self::this_sm().pinctrl().write(|w| {
+                    w.set_set_base(pin.pin());
+                    w.set_set_count(1);
+                });
+                // SET PINS, (dir)
+                unsafe { sm.exec_instr(0b11100_000_000_00000 | level as u16) };
+            }
+        });
+    }
+
     /// Flush FIFOs for state machine.
     pub fn clear_fifos(&mut self) {
         // Toggle FJOIN_RX to flush FIFOs
@@ -1000,6 +1318,20 @@ impl<'d, PIO: Instance + 'd, const SM: usize> StateMachine<'d, PIO, SM> {
     pub fn set_rxf_entry(&self, n: usize, val: u32) {
         PIO::PIO.rxf_putget(SM).putget(n).write_value(val)
     }
+
+    // pub async fn dma_pull_chained<'a, C: Channel, RF, W: Word + 'static, const N: usize, F, S, const M: usize>(
+    //     mut self,
+    //     channels: [PeripheralRef<'a, C>; M],
+    //     get_next_buffer: F,
+    //     step: S,
+    // ) -> (Self, [PeripheralRef<'a, C>; M], Result<(), ContinousError>)
+    //     where
+    //     RF: core::ops::DerefMut<Target = [W; N]>,
+    //     F: Fn() -> Option<RF> + 'a,
+    //     S: Fn(bool, usize) -> bool + 'a, {
+    //     let (c, e) = self.rx().dma_pull_chained(channels, get_next_buffer, step).await;
+    //     (self, c, e)
+    // }
 }
 
 /// PIO handle.
@@ -1231,6 +1563,21 @@ impl<'d, PIO: Instance, const N: usize> Irq<'d, PIO, N> {
     }
 }
 
+// /// Type representing a PIO interrupt.
+// pub struct FifoIrq<'d, PIO: Instance, const N: usize> {
+//     pio: PhantomData<&'d mut PIO>,
+// }
+
+// impl<'d, PIO: Instance, const N: usize> Irq<'d, PIO, N> {
+//     /// Wait for an IRQ to fire.
+//     pub fn wait<'a>(&'a mut self) -> IrqFuture<'a, 'd, PIO> {
+//         IrqFuture {
+//             pio: PhantomData,
+//             irq_no: N as u8,
+//         }
+//     }
+// }
+
 /// Interrupt flags for a PIO instance.
 #[derive(Clone)]
 pub struct IrqFlags<'d, PIO: Instance> {
@@ -1291,6 +1638,18 @@ pub struct Pio<'d, PIO: Instance> {
     pub irq2: Irq<'d, PIO, 2>,
     /// IRQ3 configuration.
     pub irq3: Irq<'d, PIO, 3>,
+    /// IRQ4 configuration.
+    #[cfg(feature = "_rp235x")]
+    pub irq4: Irq<'d, PIO, 4>,
+    /// IRQ5 configuration.
+    #[cfg(feature = "_rp235x")]
+    pub irq5: Irq<'d, PIO, 5>,
+    /// IRQ6 configuration.
+    #[cfg(feature = "_rp235x")]
+    pub irq6: Irq<'d, PIO, 6>,
+    /// IRQ7 configuration.
+    #[cfg(feature = "_rp235x")]
+    pub irq7: Irq<'d, PIO, 7>,
     /// State machine 0 handle.
     pub sm0: StateMachine<'d, PIO, 0>,
     /// State machine 1 handle.
@@ -1319,6 +1678,14 @@ impl<'d, PIO: Instance> Pio<'d, PIO> {
             irq1: Irq { pio: PhantomData },
             irq2: Irq { pio: PhantomData },
             irq3: Irq { pio: PhantomData },
+            #[cfg(feature = "_rp235x")]
+            irq4: Irq { pio: PhantomData },
+            #[cfg(feature = "_rp235x")]
+            irq5: Irq { pio: PhantomData },
+            #[cfg(feature = "_rp235x")]
+            irq6: Irq { pio: PhantomData },
+            #[cfg(feature = "_rp235x")]
+            irq7: Irq { pio: PhantomData },
             sm0: StateMachine {
                 rx: StateMachineRx { pio: PhantomData },
                 tx: StateMachineTx { pio: PhantomData },
