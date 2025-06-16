@@ -29,13 +29,41 @@ fn DMA_IRQ_0() {
     pac::DMA.ints(0).write_value(ints0);
 }
 
-pub(crate) unsafe fn init() {
-    interrupt::DMA_IRQ_0.disable();
-    interrupt::DMA_IRQ_0.set_priority(interrupt::Priority::P3);
+#[cfg(feature = "rt")]
+#[interrupt]
+fn DMA_IRQ_1() {
+    let ints0 = pac::DMA.ints(1).read();
+    for channel in 0..CHANNEL_COUNT {
+        let ctrl_trig = pac::DMA.ch(channel).ctrl_trig().read();
+        if ctrl_trig.ahb_error() {
+            panic!("DMA: error on DMA_0 channel {}", channel);
+        }
 
-    pac::DMA.inte(0).write_value(0xFFFF);
+        if ints0 & (1 << channel) == (1 << channel) {
+            CHANNEL_WAKERS[channel].wake();
+        }
+    }
+    pac::DMA.ints(1).write_value(ints0);
+}
 
-    interrupt::DMA_IRQ_0.enable();
+pub(crate) unsafe fn set_irq(irq: u32, channel: u32) {
+    if irq == 0 {
+        interrupt::DMA_IRQ_0.disable();
+        interrupt::DMA_IRQ_0.set_priority(interrupt::Priority::P3);
+
+        pac::DMA.inte(0).modify(|x| *x = *x | (0x1 << channel));
+
+        interrupt::DMA_IRQ_0.enable();
+    } else if irq == 1 {
+        interrupt::DMA_IRQ_1.disable();
+        interrupt::DMA_IRQ_1.set_priority(interrupt::Priority::P3);
+
+        pac::DMA.inte(1).modify(|x| *x = *x | 0x1 << channel);
+
+        interrupt::DMA_IRQ_1.enable();
+    } else {
+        unimplemented!()
+    }
 }
 
 /// DMA read.
@@ -231,6 +259,10 @@ pub trait Channel: Peripheral<P = Self> + SealedChannel + Into<AnyChannel> + Siz
     /// Convert into type-erased [AnyChannel].
     fn degrade(self) -> AnyChannel {
         AnyChannel { number: self.number() }
+    }
+
+    fn set_irq(&self, irq: u32) {
+        unsafe { set_irq(irq, self.number() as u32) };
     }
 }
 
