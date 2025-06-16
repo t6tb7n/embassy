@@ -236,6 +236,100 @@ impl<'a, C: Channel> Future for Transfer<'a, C> {
     }
 }
 
+/// DMA transfer driver.
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct TransferInstrumented<'a, C: Channel> {
+    channel: PeripheralRef<'a, C>,
+}
+
+impl<'a, C: Channel> TransferInstrumented<'a, C> {
+    pub(crate) fn new(channel: impl Peripheral<P = C> + 'a) -> Self {
+        into_ref!(channel);
+
+        Self { channel }
+    }
+}
+
+impl<'a, C: Channel> Drop for TransferInstrumented<'a, C> {
+    fn drop(&mut self) {
+        let p = self.channel.regs();
+        pac::DMA
+            .chan_abort()
+            .modify(|m| m.set_chan_abort(1 << self.channel.number()));
+        while p.ctrl_trig().read().busy() {}
+    }
+}
+
+impl<'a, C: Channel> Unpin for TransferInstrumented<'a, C> {}
+impl<'a, C: Channel> Future for TransferInstrumented<'a, C> {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // We need to register/re-register the waker for each poll because any
+        // calls to wake will deregister the waker.
+        CHANNEL_WAKERS[self.channel.number() as usize].register(cx.waker());
+
+        if self.channel.regs().ctrl_trig().read().busy() {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+}
+
+pub trait Abandonable {
+    fn abandon(&mut self);
+}
+
+/// DMA transfer driver.
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct ContinuousTransfer<'a, C: Channel> {
+    pub channel: Option<PeripheralRef<'a, C>>,
+}
+
+impl<'a, C: Channel> ContinuousTransfer<'a, C> {
+    pub(crate) fn new(channel: impl Peripheral<P = C> + 'a) -> Self {
+        into_ref!(channel);
+
+        Self { channel: Some(channel) }
+    }
+
+    pub fn drop_take(&mut self) -> PeripheralRef<'a, C> {
+        let p = self.channel.as_ref().unwrap().regs();
+        pac::DMA
+            .chan_abort()
+            .modify(|m| m.set_chan_abort(1 << self.channel.as_ref().unwrap().number()));
+        while p.ctrl_trig().read().busy() {}
+        self.channel.take().unwrap()
+    }
+}
+
+impl<'a, C: Channel> Drop for ContinuousTransfer<'a, C> {
+    fn drop(&mut self) {
+        assert!(self.channel.is_none());
+        // let p = self.channel.as_ref().unwrap().regs();
+        // pac::DMA
+        //     .chan_abort()
+        //     .modify(|m| m.set_chan_abort(1 << self.channel.as_ref().unwrap().number()));
+        // while p.ctrl_trig().read().busy() {}
+    }
+}
+
+impl<'a, C: Channel> Unpin for ContinuousTransfer<'a, C> {}
+impl<'a, C: Channel> Future for &ContinuousTransfer<'a, C> {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // We need to register/re-register the waker for each poll because any
+        // calls to wake will deregister the waker.
+        CHANNEL_WAKERS[self.channel.as_ref().unwrap().number() as usize].register(cx.waker());
+
+        if self.channel.as_ref().unwrap().regs().ctrl_trig().read().busy() {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+}
+
 #[cfg(feature = "rp2040")]
 pub(crate) const CHANNEL_COUNT: usize = 12;
 #[cfg(feature = "_rp235x")]
