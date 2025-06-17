@@ -51,6 +51,7 @@ struct EndpointBuffer<T: Instance> {
     addr: u16,
     len: u16,
     _phantom: PhantomData<T>,
+    buffer_id: Option<u16>,
 }
 
 impl<T: Instance> EndpointBuffer<T> {
@@ -59,22 +60,29 @@ impl<T: Instance> EndpointBuffer<T> {
             addr,
             len,
             _phantom: PhantomData,
+            buffer_id: None,
         }
     }
 
     fn read(&mut self, buf: &mut [u8]) {
         assert!(buf.len() <= self.len as usize);
         compiler_fence(Ordering::SeqCst);
-        let mem = unsafe { slice::from_raw_parts(EP_MEMORY.add(self.addr as _), buf.len()) };
+        let mem = unsafe { slice::from_raw_parts(EP_MEMORY.add((self.addr + self.buffer_id.unwrap_or(0) * 64) as _), buf.len()) };
         buf.copy_from_slice(mem);
+        if let Some(value) = self.buffer_id.as_mut() {
+            *value = if *value == 0 { 1 } else { 0 }
+        }
         compiler_fence(Ordering::SeqCst);
     }
 
     fn write(&mut self, buf: &[u8]) {
         assert!(buf.len() <= self.len as usize);
         compiler_fence(Ordering::SeqCst);
-        let mem = unsafe { slice::from_raw_parts_mut(EP_MEMORY.add(self.addr as _), buf.len()) };
+        let mem = unsafe { slice::from_raw_parts_mut(EP_MEMORY.add((self.addr + self.buffer_id.unwrap_or(0) * 64) as _), buf.len()) };
         mem.copy_from_slice(buf);
+        if let Some(value) = self.buffer_id.as_mut() {
+            *value = if *value == 0 { 1 } else { 0 }
+        }
         compiler_fence(Ordering::SeqCst);
     }
 }
@@ -185,9 +193,15 @@ impl<'d, T: Instance> Driver<'d, T> {
             return Err(EndpointAllocError);
         }
 
+
+        const DOUBLE_BUFFERED: bool = true;
         // ep mem addrs must be 64-byte aligned, so there's no point in trying
         // to allocate smaller chunks to save memory.
-        let len = (max_packet_size + 63) / 64 * 64;
+        let len = if DOUBLE_BUFFERED {
+            (max_packet_size + 63) / 64 * 64 * 2
+        } else {
+            (max_packet_size + 63) / 64 * 64
+        };
 
         let addr = self.ep_mem_free;
         if addr + len > EP_MEMORY_SIZE as u16 {
@@ -198,8 +212,9 @@ impl<'d, T: Instance> Driver<'d, T> {
 
         let buf = EndpointBuffer {
             addr,
-            len,
+            len: if DOUBLE_BUFFERED { len / 2 } else { len },
             _phantom: PhantomData,
+            buffer_id: if DOUBLE_BUFFERED { Some(0) } else { None },
         };
 
         trace!("  index={} addr={} len={}", index, buf.addr, buf.len);
@@ -221,12 +236,14 @@ impl<'d, T: Instance> Driver<'d, T> {
                 w.set_buffer_address(addr);
                 w.set_interrupt_per_buff(true);
                 w.set_endpoint_type(ep_type_reg);
+                w.set_double_buffered(DOUBLE_BUFFERED);
             }),
             Direction::In => T::dpram().ep_in_control(index - 1).write(|w| {
                 w.set_enable(false);
                 w.set_buffer_address(addr);
                 w.set_interrupt_per_buff(true);
                 w.set_endpoint_type(ep_type_reg);
+                w.set_double_buffered(DOUBLE_BUFFERED);
             }),
         }
 
@@ -459,7 +476,9 @@ impl<'d, T: Instance> driver::Bus for Bus<'d, T> {
             Direction::In => {
                 T::dpram().ep_in_control(n - 1).modify(|w| w.set_enable(enabled));
                 T::dpram().ep_in_buffer_control(ep_addr.index()).write(|w| {
+                    w.set_reset(true);
                     w.set_pid(0, true); // first packet is DATA0, but PID is flipped before
+                    w.set_pid(1, false); // first packet is DATA0, but PID is flipped before
                 });
                 EP_IN_WAKERS[n].wake();
             }
@@ -467,14 +486,21 @@ impl<'d, T: Instance> driver::Bus for Bus<'d, T> {
                 T::dpram().ep_out_control(n - 1).modify(|w| w.set_enable(enabled));
 
                 T::dpram().ep_out_buffer_control(ep_addr.index()).write(|w| {
+                    w.set_reset(true);
                     w.set_pid(0, false);
+                    w.set_pid(1, true);
                     w.set_length(0, self.ep_out[n].max_packet_size);
+                    w.set_length(1, self.ep_out[n].max_packet_size);
                 });
                 cortex_m::asm::delay(12);
                 T::dpram().ep_out_buffer_control(ep_addr.index()).write(|w| {
+                    w.set_reset(true);
                     w.set_pid(0, false);
+                    w.set_pid(1, true);
                     w.set_length(0, self.ep_out[n].max_packet_size);
+                    w.set_length(1, self.ep_out[n].max_packet_size);
                     w.set_available(0, true);
+                    w.set_available(1, true);
                 });
                 EP_OUT_WAKERS[n].wake();
             }
@@ -564,11 +590,14 @@ impl<'d, T: Instance> driver::Endpoint for Endpoint<'d, T, Out> {
 impl<'d, T: Instance> driver::EndpointOut for Endpoint<'d, T, Out> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError> {
         trace!("READ WAITING, buf.len() = {}", buf.len());
+
+        let previous_buffer_id = self.buf.buffer_id.map(|x| if x == 0 { 1 } else { 0 }).unwrap_or(0) as usize;
+        let buffer_id = self.buf.buffer_id.unwrap_or(0) as usize;
         let index = self.info.addr.index();
         let val = poll_fn(|cx| {
             EP_OUT_WAKERS[index].register(cx.waker());
             let val = T::dpram().ep_out_buffer_control(index).read();
-            if val.available(0) {
+            if val.available(buffer_id) {
                 Poll::Pending
             } else {
                 Poll::Ready(val)
@@ -576,7 +605,7 @@ impl<'d, T: Instance> driver::EndpointOut for Endpoint<'d, T, Out> {
         })
         .await;
 
-        let rx_len = val.length(0) as usize;
+        let rx_len = val.length(buffer_id) as usize;
         if rx_len > buf.len() {
             return Err(EndpointError::BufferOverflow);
         }
@@ -584,16 +613,18 @@ impl<'d, T: Instance> driver::EndpointOut for Endpoint<'d, T, Out> {
 
         trace!("READ OK, rx_len = {}", rx_len);
 
-        let pid = !val.pid(0);
-        T::dpram().ep_out_buffer_control(index).write(|w| {
-            w.set_pid(0, pid);
-            w.set_length(0, self.info.max_packet_size);
+        // let pid = !val.pid(previous_buffer_id);
+        T::dpram().ep_out_buffer_control(index).modify(|w| {
+            // w.set_pid(buffer_id, pid);
+            w.set_length(buffer_id, self.info.max_packet_size);
+            w.set_full(buffer_id, false);
         });
         cortex_m::asm::delay(12);
-        T::dpram().ep_out_buffer_control(index).write(|w| {
-            w.set_pid(0, pid);
-            w.set_length(0, self.info.max_packet_size);
-            w.set_available(0, true);
+        T::dpram().ep_out_buffer_control(index).modify(|w| {
+            // w.set_pid(buffer_id, pid);
+            w.set_length(buffer_id, self.info.max_packet_size);
+            w.set_full(buffer_id, false);
+            w.set_available(buffer_id, true);
         });
 
         Ok(rx_len)
@@ -608,11 +639,13 @@ impl<'d, T: Instance> driver::EndpointIn for Endpoint<'d, T, In> {
 
         trace!("WRITE WAITING");
 
+        let previous_buffer_id = self.buf.buffer_id.map(|x| if x == 0 { 1 } else { 0 }).unwrap_or(0) as usize;
+        let buffer_id = self.buf.buffer_id.unwrap_or(0) as usize;
         let index = self.info.addr.index();
         let val = poll_fn(|cx| {
             EP_IN_WAKERS[index].register(cx.waker());
             let val = T::dpram().ep_in_buffer_control(index).read();
-            if val.available(0) {
+            if val.available(buffer_id) {
                 Poll::Pending
             } else {
                 Poll::Ready(val)
@@ -622,12 +655,12 @@ impl<'d, T: Instance> driver::EndpointIn for Endpoint<'d, T, In> {
 
         self.buf.write(buf);
 
-        let pid = !val.pid(0);
-        T::dpram().ep_in_buffer_control(index).write(|w| {
-            w.set_pid(0, pid);
-            w.set_length(0, buf.len() as _);
-            w.set_full(0, true);
-            w.set_available(0, true);
+        // let pid = !val.pid(previous_buffer_id);
+        T::dpram().ep_in_buffer_control(index).modify(|w| {
+            // w.set_pid(buffer_id, pid);
+            w.set_length(buffer_id, buf.len() as _);
+            w.set_full(buffer_id, true);
+            w.set_available(buffer_id, true);
         });
         // cortex_m::asm::delay(12);
         // T::dpram().ep_in_buffer_control(index).write(|w| {
