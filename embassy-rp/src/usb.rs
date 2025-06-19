@@ -477,8 +477,8 @@ impl<'d, T: Instance> driver::Bus for Bus<'d, T> {
                 T::dpram().ep_in_control(n - 1).modify(|w| w.set_enable(enabled));
                 T::dpram().ep_in_buffer_control(ep_addr.index()).write(|w| {
                     w.set_reset(true);
-                    w.set_pid(0, true); // first packet is DATA0, but PID is flipped before
-                    w.set_pid(1, false); // first packet is DATA0, but PID is flipped before
+                    w.set_pid(0, false); // first packet is DATA0, but PID is flipped before
+                    w.set_pid(1, true); // first packet is DATA0, but PID is flipped before
                 });
                 EP_IN_WAKERS[n].wake();
             }
@@ -591,7 +591,6 @@ impl<'d, T: Instance> driver::EndpointOut for Endpoint<'d, T, Out> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError> {
         trace!("READ WAITING, buf.len() = {}", buf.len());
 
-        let previous_buffer_id = self.buf.buffer_id.map(|x| if x == 0 { 1 } else { 0 }).unwrap_or(0) as usize;
         let buffer_id = self.buf.buffer_id.unwrap_or(0) as usize;
         let index = self.info.addr.index();
         let val = poll_fn(|cx| {
@@ -613,15 +612,7 @@ impl<'d, T: Instance> driver::EndpointOut for Endpoint<'d, T, Out> {
 
         trace!("READ OK, rx_len = {}", rx_len);
 
-        // let pid = !val.pid(previous_buffer_id);
         T::dpram().ep_out_buffer_control(index).modify(|w| {
-            // w.set_pid(buffer_id, pid);
-            w.set_length(buffer_id, self.info.max_packet_size);
-            w.set_full(buffer_id, false);
-        });
-        cortex_m::asm::delay(12);
-        T::dpram().ep_out_buffer_control(index).modify(|w| {
-            // w.set_pid(buffer_id, pid);
             w.set_length(buffer_id, self.info.max_packet_size);
             w.set_full(buffer_id, false);
             w.set_available(buffer_id, true);
@@ -639,7 +630,6 @@ impl<'d, T: Instance> driver::EndpointIn for Endpoint<'d, T, In> {
 
         trace!("WRITE WAITING");
 
-        let previous_buffer_id = self.buf.buffer_id.map(|x| if x == 0 { 1 } else { 0 }).unwrap_or(0) as usize;
         let buffer_id = self.buf.buffer_id.unwrap_or(0) as usize;
         let index = self.info.addr.index();
         let val = poll_fn(|cx| {
@@ -655,19 +645,11 @@ impl<'d, T: Instance> driver::EndpointIn for Endpoint<'d, T, In> {
 
         self.buf.write(buf);
 
-        // let pid = !val.pid(previous_buffer_id);
         T::dpram().ep_in_buffer_control(index).modify(|w| {
-            // w.set_pid(buffer_id, pid);
             w.set_length(buffer_id, buf.len() as _);
             w.set_full(buffer_id, true);
             w.set_available(buffer_id, true);
         });
-        // cortex_m::asm::delay(12);
-        // T::dpram().ep_in_buffer_control(index).write(|w| {
-        //     w.set_pid(0, pid);
-        //     w.set_length(0, buf.len() as _);
-        //     w.set_full(0, true);
-        // });
 
         trace!("WRITE OK");
 
