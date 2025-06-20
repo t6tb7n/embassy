@@ -5,6 +5,8 @@ use crate::raw::{SyncExecutor, TaskRef};
 extern "Rust" {
     fn _embassy_trace_task_new(executor_id: u32, task_id: u32);
     fn _embassy_trace_task_exec_begin(executor_id: u32, task_id: u32);
+    fn _embassy_trace_task_exec_begin2(task_id: u32);
+    fn _embassy_trace_task_exec_begin3(task_id: u32);
     fn _embassy_trace_task_exec_end(excutor_id: u32, task_id: u32);
     fn _embassy_trace_task_ready_begin(executor_id: u32, task_id: u32);
     fn _embassy_trace_executor_idle(executor_id: u32);
@@ -39,6 +41,26 @@ pub(crate) fn task_exec_begin(executor: &SyncExecutor, task: &TaskRef) {
     }
     #[cfg(feature = "rtos-trace")]
     rtos_trace::trace::task_exec_begin(task.as_ptr() as u32);
+}
+
+#[inline]
+pub(crate) fn task_exec_begin2(task: &TaskRef) {
+    #[cfg(not(feature = "rtos-trace"))]
+    unsafe {
+        _embassy_trace_task_exec_begin2(task.as_ptr() as u32)
+    }
+    #[cfg(feature = "rtos-trace")]
+    rtos_trace::trace::task_exec_begin2(task.as_ptr() as u32);
+}
+
+#[inline]
+pub(crate) fn task_exec_begin3(task: &TaskRef) {
+    #[cfg(not(feature = "rtos-trace"))]
+    unsafe {
+        _embassy_trace_task_exec_begin3(task.as_ptr() as u32)
+    }
+    #[cfg(feature = "rtos-trace")]
+    rtos_trace::trace::task_exec_begin3(task.as_ptr() as u32);
 }
 
 #[inline]

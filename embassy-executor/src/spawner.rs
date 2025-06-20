@@ -41,6 +41,10 @@ impl<S> SpawnToken<S> {
             phantom: PhantomData,
         }
     }
+
+    pub fn tid(&self) -> Option<u32> {
+        self.raw_task.map(|x| x.as_ptr() as u32)
+    }
 }
 
 impl<S> Drop for SpawnToken<S> {

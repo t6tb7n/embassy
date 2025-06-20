@@ -211,6 +211,8 @@ impl<F: Future + 'static> TaskStorage<F> {
         let future = Pin::new_unchecked(this.future.as_mut());
         let waker = waker::from_task(p);
         let mut cx = Context::from_waker(&waker);
+        #[cfg(feature = "trace")]
+        trace::task_exec_begin2(&p);
         match future.poll(&mut cx) {
             Poll::Ready(_) => {
                 // As the future has finished and this function will not be called
@@ -227,6 +229,8 @@ impl<F: Future + 'static> TaskStorage<F> {
             }
             Poll::Pending => {}
         }
+        #[cfg(feature = "trace")]
+        trace::task_exec_begin3(&p);
 
         // the compiler is emitting a virtual call for waker drop, but we know
         // it's a noop for our waker.
