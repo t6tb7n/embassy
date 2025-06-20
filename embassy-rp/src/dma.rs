@@ -12,9 +12,32 @@ use crate::interrupt::InterruptExt;
 use crate::pac::dma::vals;
 use crate::{interrupt, pac, peripherals};
 
+struct MyMutex<T> {
+    data: core::cell::UnsafeCell<T>,
+}
+impl<T> MyMutex<T> {
+    const fn new(data: T) -> Self {
+        Self {
+            data: core::cell::UnsafeCell::new(data),
+        }
+    }
+
+    fn lock<R, F: Fn(&mut T) -> R>(&self, f: F) -> R {
+        f(unsafe { &mut *self.data.get() })
+    }
+}
+unsafe impl<T> Send for MyMutex<T> {}
+unsafe impl<T> Sync for MyMutex<T> {}
+
+extern "Rust" {
+    fn _dma_channel_interrupt_tick();
+    fn _dma_channel_interrupt_trace(channel: u32);
+}
+
 #[cfg(feature = "rt")]
 #[interrupt]
 fn DMA_IRQ_0() {
+    unsafe { _dma_channel_interrupt_tick() };
     let ints0 = pac::DMA.ints(0).read();
     for channel in 0..CHANNEL_COUNT {
         let ctrl_trig = pac::DMA.ch(channel).ctrl_trig().read();
@@ -23,6 +46,7 @@ fn DMA_IRQ_0() {
         }
 
         if ints0 & (1 << channel) == (1 << channel) {
+            unsafe { _dma_channel_interrupt_trace(channel as u32) };
             CHANNEL_WAKERS[channel].wake();
         }
     }
@@ -32,6 +56,7 @@ fn DMA_IRQ_0() {
 #[cfg(feature = "rt")]
 #[interrupt]
 fn DMA_IRQ_1() {
+    unsafe { _dma_channel_interrupt_tick() };
     let ints0 = pac::DMA.ints(1).read();
     for channel in 0..CHANNEL_COUNT {
         let ctrl_trig = pac::DMA.ch(channel).ctrl_trig().read();
@@ -40,6 +65,7 @@ fn DMA_IRQ_1() {
         }
 
         if ints0 & (1 << channel) == (1 << channel) {
+            unsafe { _dma_channel_interrupt_trace(channel as u32) };
             CHANNEL_WAKERS[channel].wake();
         }
     }
