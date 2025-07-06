@@ -897,6 +897,10 @@ macro_rules! impl_gpoutpin {
     };
 }
 
+#[cfg(feature = "_rp235x")]
+impl_gpoutpin!(PIN_13, 0);
+#[cfg(feature = "_rp235x")]
+impl_gpoutpin!(PIN_15, 1);
 impl_gpoutpin!(PIN_21, 0);
 impl_gpoutpin!(PIN_23, 1);
 impl_gpoutpin!(PIN_24, 2);
@@ -938,7 +942,14 @@ impl<'d, T: GpoutPin> Gpout<'d, T> {
     pub fn new(gpout: impl Peripheral<P = T> + 'd) -> Self {
         into_ref!(gpout);
 
+        #[cfg(feature = "rp2040")]
         gpout.gpio().ctrl().write(|w| w.set_funcsel(0x08));
+
+        #[cfg(feature = "_rp235x")]
+        gpout.gpio().ctrl().write(|w| {
+            w.set_funcsel(0x09);
+        });
+        
         #[cfg(feature = "_rp235x")]
         gpout.pad_ctrl().write(|w| {
             w.set_iso(false);
