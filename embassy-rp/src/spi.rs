@@ -340,17 +340,18 @@ impl<'d, T: Instance> Spi<'d, T, Async> {
         clk: impl Peripheral<P = impl ClkPin<T> + 'd> + 'd,
         mosi: impl Peripheral<P = impl MosiPin<T> + 'd> + 'd,
         miso: impl Peripheral<P = impl MisoPin<T> + 'd> + 'd,
+        cs: impl Peripheral<P = impl CsPin<T> + 'd> + 'd,
         tx_dma: impl Peripheral<P = impl Channel> + 'd,
         rx_dma: impl Peripheral<P = impl Channel> + 'd,
         config: Config,
     ) -> Self {
-        into_ref!(tx_dma, rx_dma, clk, mosi, miso);
+        into_ref!(tx_dma, rx_dma, clk, mosi, miso, cs);
         Self::new_inner(
             inner,
             Some(clk.map_into()),
             Some(mosi.map_into()),
             Some(miso.map_into()),
-            None,
+            Some(cs.map_into()),
             Some(tx_dma.map_into()),
             Some(rx_dma.map_into()),
             config,
