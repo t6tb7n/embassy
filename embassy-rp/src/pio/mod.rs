@@ -487,7 +487,7 @@ impl<'d, PIO: Instance, const SM: usize> StateMachineRx<'d, PIO, SM> {
         mut step: S,
     ) -> impl 'a + 'b + Future<Output = ([PeripheralRef<'b, C>; M], usize, usize, Result<(), ContinousError>)>
     where
-        RF: core::ops::DerefMut<Target = [W; N]> + Abandonable,
+        RF: core::ops::DerefMut<Target = [W; N]> + crate::dma::Abandonable,
         F: Fn() -> Option<RF> + 'a + 'b,
         S: FnMut(bool, usize) -> bool + 'a + 'b,
         'b: 'a,
@@ -542,7 +542,7 @@ impl<'d, PIO: Instance, const SM: usize> StateMachineRx<'d, PIO, SM> {
             let mut transfers = channels.map(|c| {
                 let buffer = get_next_buffer().unwrap();
                 c.regs().write_addr().write_value(buffer.as_ptr() as u32);
-                let transfer = ContinuousTransfer::new(c);
+                let transfer = crate::dma::ContinuousTransfer::new(c);
                 (transfer, Some(buffer))
             });
 

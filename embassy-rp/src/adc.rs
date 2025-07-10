@@ -149,7 +149,7 @@ impl<'d, M: Mode> Drop for Adc<'d, M> {
 
 impl<'d, M: Mode> Adc<'d, M> {
     #[inline]
-    fn regs() -> pac::adc::Adc {
+    pub fn regs() -> pac::adc::Adc {
         pac::ADC
     }
 
@@ -184,6 +184,25 @@ impl<'d, M: Mode> Adc<'d, M> {
             true => Err(Error::ConversionFailed),
             false => Ok(r.result().read().result()),
         }
+    }
+}
+
+#[derive(Debug)]
+pub enum ContinousError {
+    BufferFull,
+    Stalled,
+}
+
+struct ResetDmaConfig;
+impl Drop for ResetDmaConfig {
+    fn drop(&mut self) {
+        pac::ADC.cs().write_clear(|w| w.set_start_many(true));
+        while !pac::ADC.cs().read().ready() {}
+        pac::ADC.fcs().write_clear(|w| {
+            w.set_dreq_en(true);
+            w.set_shift(true);
+            w.set_en(true);
+        });
     }
 }
 
@@ -232,6 +251,48 @@ impl<'d> Adc<'d, Async> {
         }
     }
 
+    fn configure_read_many_inner<W: dma::Word>(
+            &mut self,
+            channels: impl Iterator<Item = u8>,
+            fcs_err: bool,
+        ) {
+            #[cfg(feature = "rp2040")]
+            let mut rrobin = 0_u8;
+            #[cfg(feature = "_rp235x")]
+            let mut rrobin = 0_u16;
+            for c in channels {
+                rrobin |= 1 << c;
+            }
+            let first_ch = rrobin.trailing_zeros() as u8;
+            if rrobin.count_ones() == 1 {
+                rrobin = 0;
+            }
+
+            let r = Self::regs();
+            // clear previous errors and set channel
+            r.cs().modify(|w| {
+                w.set_ainsel(first_ch);
+                w.set_rrobin(rrobin);
+                w.set_err_sticky(true); // clear previous errors
+                w.set_start_many(false);
+            });
+            // wait for previous conversions and drain fifo. an earlier batch read may have
+            // been cancelled, leaving the adc running.
+            while !r.cs().read().ready() {}
+            while !r.fcs().read().empty() {
+                r.fifo().read();
+            }
+
+            // set up fifo for dma
+            r.fcs().write(|w| {
+                w.set_thresh(1);
+                w.set_dreq_en(true);
+                w.set_shift(mem::size_of::<W>() == 1);
+                w.set_en(true);
+                w.set_err(fcs_err);
+            });
+        }
+
     // Note for refactoring: we don't require the actual Channels here, just the channel numbers.
     // The public api is responsible for asserting ownership of the actual Channels.
     async fn read_many_inner<W: dma::Word>(
@@ -242,58 +303,14 @@ impl<'d> Adc<'d, Async> {
         div: u16,
         dma: impl Peripheral<P = impl dma::Channel>,
     ) -> Result<(), Error> {
-        #[cfg(feature = "rp2040")]
-        let mut rrobin = 0_u8;
-        #[cfg(feature = "_rp235x")]
-        let mut rrobin = 0_u16;
-        for c in channels {
-            rrobin |= 1 << c;
-        }
-        let first_ch = rrobin.trailing_zeros() as u8;
-        if rrobin.count_ones() == 1 {
-            rrobin = 0;
-        }
-
-        let r = Self::regs();
-        // clear previous errors and set channel
-        r.cs().modify(|w| {
-            w.set_ainsel(first_ch);
-            w.set_rrobin(rrobin);
-            w.set_err_sticky(true); // clear previous errors
-            w.set_start_many(false);
-        });
-        // wait for previous conversions and drain fifo. an earlier batch read may have
-        // been cancelled, leaving the adc running.
-        while !r.cs().read().ready() {}
-        while !r.fcs().read().empty() {
-            r.fifo().read();
-        }
-
-        // set up fifo for dma
-        r.fcs().write(|w| {
-            w.set_thresh(1);
-            w.set_dreq_en(true);
-            w.set_shift(mem::size_of::<W>() == 1);
-            w.set_en(true);
-            w.set_err(fcs_err);
-        });
+    
+        self.configure_read_many_inner::<W>(channels, false);
 
         // reset dma config on drop, regardless of whether it was a future being cancelled
         // or the method returning normally.
-        struct ResetDmaConfig;
-        impl Drop for ResetDmaConfig {
-            fn drop(&mut self) {
-                pac::ADC.cs().write_clear(|w| w.set_start_many(true));
-                while !pac::ADC.cs().read().ready() {}
-                pac::ADC.fcs().write_clear(|w| {
-                    w.set_dreq_en(true);
-                    w.set_shift(true);
-                    w.set_en(true);
-                });
-            }
-        }
         let auto_reset = ResetDmaConfig;
 
+        let r = Self::regs();
         let dma = unsafe { dma::read(dma, r.fifo().as_ptr() as *const W, buf as *mut [W], TreqSel::ADC) };
         // start conversions and wait for dma to finish. we can't report errors early
         // because there's no interrupt to signal them, and inspecting every element
@@ -325,6 +342,174 @@ impl<'d> Adc<'d, Async> {
     ) -> Result<(), Error> {
         self.read_many_inner(ch.iter().map(|c| c.channel()), buf, false, div, dma)
             .await
+    }
+
+    /// Sample multiple values from multiple channels using chained DMA channels.
+    pub fn read_continuous_multichannel<'a, 'b, C, RF, W, const N: usize, F, S, const M: usize>(
+        &'a mut self,
+        adc_channels: &mut [Channel<'_>],
+        channels: [PeripheralRef<'b, C>; M],
+        get_next_buffer: F,
+        mut step: S,
+        div: u16
+    ) -> impl 'a + 'b + Future<Output = ([PeripheralRef<'b, C>; M], usize, usize, usize, Result<(), ContinousError>)>
+    where
+        C: crate::dma::Channel,
+        W: crate::dma::Word + 'static,
+        RF: core::ops::DerefMut<Target = [W; N]> + crate::dma::Abandonable,
+        F: Fn() -> Option<RF> + 'a + 'b,
+        S: FnMut(bool, bool, usize) -> bool + 'a + 'b,
+        'b: 'a,
+    {
+        // Configure ADC
+        self.configure_read_many_inner::<W>(adc_channels.iter().map(|c| c.channel()), false);
+
+        // Configure DMA channels
+        for channel in channels.windows(2) {
+            let p = channel[0].regs();
+            p.read_addr().write_value(Self::regs().fifo().as_ptr() as u32);
+            #[cfg(feature = "rp2040")]
+            p.trans_count().write(|w| *w = data1.len() as u32);
+            #[cfg(feature = "_rp235x")]
+            p.trans_count().write(|w| w.set_count(N as u32));
+            // compiler_fence(Ordering::SeqCst);
+            p.al1_ctrl().write(|w| {
+                // Set RX DREQ for this statemachine
+                w.set_treq_sel(TreqSel::ADC);
+                w.set_data_size(W::size());
+                w.set_chain_to(channel[1].number());
+                w.set_incr_read(false);
+                w.set_incr_write(true);
+                w.set_bswap(false);
+                w.set_en(true);
+            });
+        }
+
+        let p = channels[channels.len() - 1].regs();
+        p.read_addr().write_value(Self::regs().fifo().as_ptr() as u32);
+        #[cfg(feature = "rp2040")]
+        p.trans_count().write(|w| *w = data2.len() as u32);
+        #[cfg(feature = "_rp235x")]
+        p.trans_count().write(|w| w.set_count(N as u32));
+        // compiler_fence(Ordering::SeqCst);
+        p.al1_ctrl().write(|w| {
+            // Set RX DREQ for this statemachine
+            w.set_treq_sel(TreqSel::ADC);
+            w.set_data_size(W::size());
+            w.set_chain_to(channels[channels.len() - 1].number());
+            w.set_incr_read(false);
+            w.set_incr_write(true);
+            w.set_bswap(false);
+            w.set_en(true);
+        });
+
+        compiler_fence(Ordering::SeqCst);
+
+        async move {
+            // Configure buffers
+            let first_channel_number = channels[0].number();
+
+            let mut transfers = channels.map(|c| {
+                let buffer = get_next_buffer().unwrap();
+                c.regs().write_addr().write_value(buffer.as_ptr() as u32);
+                let transfer = crate::dma::ContinuousTransfer::new(c);
+                (transfer, Some(buffer))
+            });
+
+            // Trigger first DMA chanel
+            pac::DMA
+                .multi_chan_trigger()
+                .write(|w| w.set_multi_chan_trigger(0x1 << first_channel_number));
+
+            let _auto_reset = ResetDmaConfig;
+
+            // Start conversions.
+            Self::regs().div().write(|w| w.set_int(div));
+            Self::regs().cs().modify(|w| w.set_start_many(true));
+
+            let mut current = 0;
+            let mut count = 0;
+            let mut stalled = 0;
+            let mut conversion_errors = 0;
+
+            loop {
+                (&transfers[current].0).await;
+                transfers[current].1.take();
+                count += 1;
+                // Check if FIFO overflow occured
+                let overflowed = Self::overflowed();
+                // check if conversion error occurred and reset.
+                let conversion_error = Self::regs().cs().read().err_sticky();
+                Self::regs().cs().read().set_err_sticky(true);
+                if overflowed {
+                    stalled += 1;
+                }
+                if conversion_error {
+                    conversion_errors += 1;
+                }
+                if step(overflowed, conversion_error, count) {
+                    break;
+                }
+                let previous = if current == 0 { M - 1 } else { current - 1 };
+                if let Some(data) = get_next_buffer() {
+                    transfers[current]
+                        .0
+                        .channel
+                        .as_ref()
+                        .unwrap()
+                        .regs()
+                        .write_addr()
+                        .write_value(data.as_ptr() as u32);
+                    transfers[current].1 = Some(data);
+                    let current_channel_number = transfers[current].0.channel.as_ref().unwrap().number();
+                    transfers[current]
+                        .0
+                        .channel
+                        .as_ref()
+                        .unwrap()
+                        .regs()
+                        .al1_ctrl()
+                        .modify(|w| w.set_chain_to(current_channel_number));
+                    transfers[previous]
+                        .0
+                        .channel
+                        .as_ref()
+                        .unwrap()
+                        .regs()
+                        .al1_ctrl()
+                        .modify(|w| w.set_chain_to(current_channel_number));
+                    current = (current + 1) % M;
+                } else {
+                    transfers.rotate_left(current);
+                    return (
+                        transfers.map(|mut x| {
+                            if let Some(mut buffer) = x.1 {
+                                buffer.abandon();
+                            }
+                            x.0.drop_take()
+                        }),
+                        count,
+                        stalled,
+                        conversion_errors,
+                        Err(ContinousError::BufferFull),
+                    );
+                }
+            }
+
+            transfers.rotate_left(current);
+            (
+                transfers.map(|mut x| {
+                    if let Some(mut buffer) = x.1 {
+                        buffer.abandon();
+                    }
+                    x.0.drop_take()
+                }),
+                count,
+                stalled,
+                conversion_errors,
+                Ok(()),
+            )
+        }
     }
 
     /// Sample multiple values from multiple channels using DMA, with errors inlined in samples.
@@ -387,6 +572,12 @@ impl<'d> Adc<'d, Async> {
                 dma,
             )
             .await;
+    }
+
+    /// Return true if the FIFO overflowed and samples were dropped.
+    pub fn overflowed() -> bool {
+        let r = Self::regs();
+        r.fcs().read().over()
     }
 }
 

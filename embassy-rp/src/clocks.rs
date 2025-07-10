@@ -1002,6 +1002,12 @@ impl<'d, T: GpoutPin> Gpout<'d, T> {
         });
     }
 
+    /// Disable clock.
+    pub fn is_enabled(&self) -> bool {
+        let c = pac::CLOCKS;
+        c.clk_gpout_ctrl(self.gpout.number()).read().enabled()
+    }
+
     /// Clock frequency.
     pub fn get_freq(&self) -> u32 {
         let c = pac::CLOCKS;
