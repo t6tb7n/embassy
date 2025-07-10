@@ -19,6 +19,12 @@ trait SealedInstance {
     fn dpram() -> crate::pac::usb_dpram::UsbDpram;
 }
 
+#[cfg(target_arch = "arm")]
+use cortex_m as target_arch;
+
+#[cfg(target_arch = "riscv32")]
+use riscv as target_arch;
+
 /// USB peripheral instance.
 #[allow(private_bounds)]
 pub trait Instance: SealedInstance + 'static {
@@ -492,7 +498,7 @@ impl<'d, T: Instance> driver::Bus for Bus<'d, T> {
                     w.set_length(0, self.ep_out[n].max_packet_size);
                     w.set_length(1, self.ep_out[n].max_packet_size);
                 });
-                cortex_m::asm::delay(12);
+                target_arch::asm::delay(12);
                 T::dpram().ep_out_buffer_control(ep_addr.index()).write(|w| {
                     w.set_reset(true);
                     w.set_pid(0, false);
@@ -707,7 +713,7 @@ impl<'d, T: Instance> driver::ControlPipe for ControlPipe<'d, T> {
             w.set_length(0, self.max_packet_size);
             w.set_pid(0, pid);
         });
-        cortex_m::asm::delay(12);
+        target_arch::asm::delay(12);
         bufcontrol.write(|w| {
             w.set_length(0, self.max_packet_size);
             w.set_pid(0, pid);
@@ -752,7 +758,7 @@ impl<'d, T: Instance> driver::ControlPipe for ControlPipe<'d, T> {
             w.set_pid(0, pid);
             w.set_full(0, true);
         });
-        cortex_m::asm::delay(12);
+        target_arch::asm::delay(12);
         bufcontrol.write(|w| {
             w.set_length(0, data.len() as _);
             w.set_pid(0, pid);
@@ -779,7 +785,7 @@ impl<'d, T: Instance> driver::ControlPipe for ControlPipe<'d, T> {
                 w.set_length(0, 0);
                 w.set_pid(0, true);
             });
-            cortex_m::asm::delay(12);
+            target_arch::asm::delay(12);
             bufcontrol.write(|w| {
                 w.set_length(0, 0);
                 w.set_pid(0, true);
@@ -799,7 +805,7 @@ impl<'d, T: Instance> driver::ControlPipe for ControlPipe<'d, T> {
             w.set_pid(0, true);
             w.set_full(0, true);
         });
-        cortex_m::asm::delay(12);
+        target_arch::asm::delay(12);
         bufcontrol.write(|w| {
             w.set_length(0, 0);
             w.set_pid(0, true);

@@ -53,6 +53,12 @@ use crate::interrupt::InterruptExt;
 use crate::peripherals::CORE1;
 use crate::{gpio, install_stack_guard, interrupt, pac};
 
+#[cfg(target_arch = "arm")]
+use cortex_m as target_arch;
+
+#[cfg(target_arch = "riscv32")]
+use riscv as target_arch;
+
 const PAUSE_TOKEN: u32 = 0xDEADBEEF;
 const RESUME_TOKEN: u32 = !0xDEADBEEF;
 static IS_CORE1_INIT: AtomicBool = AtomicBool::new(false);
@@ -63,7 +69,7 @@ unsafe fn core1_setup(stack_bottom: *mut usize) {
         // currently only happens if the MPU was already set up, which
         // would indicate that the core is already in use from outside
         // embassy, somehow. trap if so since we can't deal with that.
-        cortex_m::asm::udf();
+        target_arch::asm::udf();
     }
 
     #[cfg(feature = "_rp235x")]
@@ -99,14 +105,14 @@ unsafe fn SIO_IRQ_PROC1() {
     while sio.fifo().st().read().vld() {
         // Pause CORE1 execution and disable interrupts
         if fifo_read_wfe() == PAUSE_TOKEN {
-            cortex_m::interrupt::disable();
+            target_arch::interrupt::disable();
             // Signal to CORE0 that execution is paused
             fifo_write(PAUSE_TOKEN);
             // Wait for `resume` signal from CORE0
             while fifo_read_wfe() != RESUME_TOKEN {
-                cortex_m::asm::nop();
+                target_arch::asm::nop();
             }
-            cortex_m::interrupt::enable();
+            target_arch::interrupt::enable();
             // Signal to CORE0 that execution is resumed
             fifo_write(RESUME_TOKEN);
         }
@@ -124,14 +130,14 @@ unsafe fn SIO_IRQ_FIFO() {
     while sio.fifo().st().read().vld() {
         // Pause CORE1 execution and disable interrupts
         if fifo_read_wfe() == PAUSE_TOKEN {
-            cortex_m::interrupt::disable();
+            target_arch::interrupt::disable();
             // Signal to CORE0 that execution is paused
             fifo_write(PAUSE_TOKEN);
             // Wait for `resume` signal from CORE0
             while fifo_read_wfe() != RESUME_TOKEN {
-                cortex_m::asm::nop();
+                target_arch::asm::nop();
             }
-            cortex_m::interrupt::enable();
+            target_arch::interrupt::enable();
             // Signal to CORE0 that execution is resumed
             fifo_write(RESUME_TOKEN);
         }
@@ -176,7 +182,7 @@ where
         // Enable FPU
         #[cfg(all(feature = "_rp235x", has_fpu))]
         unsafe {
-            let p = cortex_m::Peripherals::steal();
+            let p = target_arch::Peripherals::steal();
             p.SCB.cpacr.modify(|cpacr| cpacr | (3 << 20) | (3 << 22));
         }
 
@@ -187,7 +193,7 @@ where
     let psm = pac::PSM;
     psm.frce_off().modify(|w| w.set_proc1(true));
     while !psm.frce_off().read().proc1() {
-        cortex_m::asm::nop();
+        target_arch::asm::nop();
     }
     psm.frce_off().modify(|w| w.set_proc1(false));
 
@@ -224,7 +230,7 @@ where
     // memory caches, and writes happen in-order.
     compiler_fence(Ordering::Release);
 
-    let p = unsafe { cortex_m::Peripherals::steal() };
+    let p = unsafe { target_arch::Peripherals::steal() };
     let vector_table = p.SCB.vtor.read();
 
     // After reset, core 1 is waiting to receive commands over FIFO.
@@ -244,7 +250,7 @@ where
         let cmd = cmd_seq[seq] as u32;
         if cmd == 0 {
             fifo_drain();
-            cortex_m::asm::sev();
+            target_arch::asm::sev();
         }
         fifo_write(cmd);
 
@@ -292,12 +298,12 @@ fn fifo_write(value: u32) {
     let sio = pac::SIO;
     // Wait for the FIFO to have enough space
     while !sio.fifo().st().read().rdy() {
-        cortex_m::asm::nop();
+        target_arch::asm::nop();
     }
     sio.fifo().wr().write_value(value);
     // Fire off an event to the other core.
     // This is required as the other core may be `wfe` (waiting for event)
-    cortex_m::asm::sev();
+    target_arch::asm::sev();
 }
 
 // Pop a value from inter-core FIFO, block until available
@@ -306,7 +312,7 @@ fn fifo_read() -> u32 {
     let sio = pac::SIO;
     // Wait until FIFO has data
     while !sio.fifo().st().read().vld() {
-        cortex_m::asm::nop();
+        target_arch::asm::nop();
     }
     sio.fifo().rd().read()
 }
@@ -318,7 +324,7 @@ fn fifo_read_wfe() -> u32 {
     let sio = pac::SIO;
     // Wait until FIFO has data
     while !sio.fifo().st().read().vld() {
-        cortex_m::asm::wfe();
+        target_arch::asm::wfe();
     }
     sio.fifo().rd().read()
 }

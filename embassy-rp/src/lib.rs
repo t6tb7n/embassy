@@ -514,6 +514,7 @@ select_imagedef! {
 ///     // ...
 /// }
 /// ```
+#[cfg(not(target_arch = "riscv32"))]
 pub fn install_core0_stack_guard() -> Result<(), ()> {
     extern "C" {
         static mut _stack_end: usize;
@@ -549,7 +550,7 @@ unsafe fn install_stack_guard(stack_bottom: *mut usize) -> Result<(), ()> {
     Ok(())
 }
 
-#[cfg(all(feature = "_rp235x", not(feature = "_test")))]
+#[cfg(all(feature = "_rp235x", not(feature = "_test"), not(target_arch = "riscv32")))]
 #[inline(always)]
 unsafe fn install_stack_guard(stack_bottom: *mut usize) -> Result<(), ()> {
     let core = unsafe { cortex_m::Peripherals::steal() };

@@ -2,6 +2,12 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::pac;
 
+#[cfg(target_arch = "arm")]
+use cortex_m as target_arch;
+
+#[cfg(target_arch = "riscv32")]
+use riscv as target_arch;
+
 struct RpSpinlockCs;
 critical_section::set_impl!(RpSpinlockCs);
 
@@ -36,7 +42,7 @@ unsafe impl critical_section::Impl for RpSpinlockCs {
 impl RpSpinlockCs {
     unsafe fn acquire() -> u8 {
         // Store the initial interrupt state and current core id in stack variables
-        let interrupts_active = cortex_m::register::primask::read().is_active();
+        let interrupts_active = target_arch::register::primask::read().is_active();
         // We reserved 0 as our `LOCK_UNOWNED` value, so add 1 to core_id so we get 1 for core0, 2 for core1.
         let core = pac::SIO.cpuid().read() as u8 + 1;
         // Do we already own the spinlock?
@@ -49,7 +55,7 @@ impl RpSpinlockCs {
             loop {
                 // Need to disable interrupts to ensure that we will not deadlock
                 // if an interrupt enters critical_section::Impl after we acquire the lock
-                cortex_m::interrupt::disable();
+                target_arch::interrupt::disable();
                 // Ensure the compiler doesn't re-order accesses and violate safety here
                 core::sync::atomic::compiler_fence(Ordering::SeqCst);
                 // Read the spinlock reserved for `critical_section`
@@ -63,7 +69,7 @@ impl RpSpinlockCs {
                 }
                 // We didn't get the lock, enable interrupts if they were enabled before we started
                 if interrupts_active {
-                    cortex_m::interrupt::enable();
+                    target_arch::interrupt::enable();
                 }
             }
             // If we broke out of the loop we have just acquired the lock
@@ -86,7 +92,7 @@ impl RpSpinlockCs {
             // We only do this on the outermost `critical_section` to ensure interrupts stay disabled
             // for the whole time that we have the lock
             if token != 0 {
-                cortex_m::interrupt::enable();
+                target_arch::interrupt::enable();
             }
         }
     }

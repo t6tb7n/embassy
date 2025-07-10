@@ -87,7 +87,7 @@ unsafe impl RawMutex for NoopRawMutex {
 
 // ================
 
-#[cfg(any(cortex_m, feature = "std"))]
+// #[cfg(any(cortex_m, feature = "std"))]
 mod thread_mode {
     use super::*;
 
@@ -145,5 +145,5 @@ mod thread_mode {
         return unsafe { (0xE000ED04 as *const u32).read_volatile() } & 0x1FF == 0;
     }
 }
-#[cfg(any(cortex_m, feature = "std"))]
+// #[cfg(any(cortex_m, feature = "std"))]
 pub use thread_mode::*;
